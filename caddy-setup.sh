@@ -118,7 +118,10 @@ fi
 # ---------- try APK install ----------
 APK_INSTALLED=0
 if apk add --no-cache caddy caddy-openrc >/dev/null 2>&1; then
-  APK_INSTALLED=1
+  # Verify the package was actually installed and binary exists
+  if apk info -e caddy >/dev/null 2>&1 && { [ -x /usr/bin/caddy ] || [ -x /usr/sbin/caddy ]; }; then
+    APK_INSTALLED=1
+  fi
 fi
 
 # ---------- fallback: GitHub Releases (latest tag + asset) ----------
@@ -126,7 +129,7 @@ fetch_caddy_release() {
   ARCH="$(uname -m)"
   case "$ARCH" in
     x86_64)        DL_ARCH="amd64" ;;
-    aarch64)       DL_ARCH="arm64" ;;
+    aarch64|arm64) DL_ARCH="arm64" ;;
     armv7l|armv7)  DL_ARCH="armv7" ;;
     *) echo "[x] Unsupported arch: $ARCH" >&2; return 1 ;;
   esac
@@ -137,15 +140,11 @@ fetch_caddy_release() {
     HDRS="$HDRS -H Authorization: Bearer ${GITHUB_TOKEN}"
   fi
   JSON="$(sh -c "curl -fsSL $HDRS $API_URL")" || return 1
-  TAG="$(printf '%s' "$JSON" | awk -F'"' '/"tag_name":/ {print $4; exit}')"
+  TAG="$(printf '%s' "$JSON" | awk -F'"' '/"tag_name"/ {for(i=1;i<=NF;i++) if($i=="tag_name") print $(i+2); exit}')"
   [ -n "$TAG" ] || { echo "[x] Could not determine latest Caddy tag from GitHub API." >&2; return 1; }
 
   # Pick the correct asset (name ends with _linux_<arch>.tar.gz)
-  URL="$(printf '%s' "$JSON" \
-    | awk -F'"' -v suff="_linux_${DL_ARCH}.tar.gz" '
-        $2=="name" {name=$4}
-        $2=="browser_download_url" {url=$4; if (name ~ suff) {print url; exit}}
-      ')"
+  URL="$(printf '%s' "$JSON" | grep -o "https://[^\"]*_linux_${DL_ARCH}\.tar\.gz" | grep -v '\.sig$' | head -n1)"
   [ -n "$URL" ] || { echo "[x] Could not find a linux ${DL_ARCH} asset in ${TAG}" >&2; return 1; }
 
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
@@ -166,12 +165,21 @@ fetch_caddy_release() {
 }
 
 if [ $APK_INSTALLED -eq 0 ]; then
-  say "apk caddy not present — fetching Caddy from GitHub Releases…"
-  fetch_caddy_release || die "Failed to obtain Caddy binary."
+  warn "APK install of Caddy failed or binary not found — fetching from GitHub Releases…"
+  fetch_caddy_release || die "Failed to obtain Caddy binary from GitHub. Check network connectivity."
 fi
 
 CADDY_BIN="$(command -v caddy 2>/dev/null || true)"
-[ -n "$CADDY_BIN" ] || die "Caddy binary not found after install."
+if [ -z "$CADDY_BIN" ]; then
+  # Fallback: check common install locations
+  for path in /usr/bin/caddy /usr/local/bin/caddy /usr/sbin/caddy; do
+    if [ -x "$path" ]; then
+      CADDY_BIN="$path"
+      break
+    fi
+  done
+fi
+[ -n "$CADDY_BIN" ] && [ -x "$CADDY_BIN" ] || die "Caddy binary not found after install."
 
 say "Caddy binary: $CADDY_BIN"
 "$CADDY_BIN" version || true
