@@ -1,15 +1,13 @@
 #!/bin/sh
 # caddy-setup.sh — Alpine (OpenRC) Caddy with INTERNAL TLS (LAN-only)
-# - Interactive by default; or pass flags (no env vars are read).
-# - Prefers APK install; auto-enables 'community' for your Alpine release.
-# - Robust fallback to GitHub Releases (uses API to resolve latest versioned asset).
+# - Prefers APK install; auto-enables 'main' + 'community' for your Alpine branch.
+# - Robust fallback to GitHub Releases (parses latest tag + picks correct *_linux_<arch>.tar.gz).
 # - Per-vhost layout in /etc/caddy/sites/*.caddy (one file per hostname).
 # - Helpers: caddy-add / caddy-del (validate before reload; auto-detect caddy path).
-# - Optional purge of an existing Caddy install (with backup).
+# - Runs Caddy as 'caddy' user (cap_net_bind_service set on the binary).
 
 set -eu
 
-# ---------- utils ----------
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[x]\033[0m %s\n' "$*"; }
@@ -23,10 +21,10 @@ Usage:
 Interactive if flags are omitted.
 
 Flags:
-  --domain        Your base domain (e.g., example.com)
+  --domain        Your base domain (e.g., cordele.xyz)
   --home-label    Sub-zone label (default: home) -> serves home.<domain> and subdomains
   --admin-email   Email for Caddy metadata (internal CA)
-  --purge         If Caddy already exists: yes|no (if omitted, you'll be asked)
+  --purge         If an older Caddy install exists: yes|no (default: ask)
 EOF
 }
 
@@ -102,11 +100,11 @@ if [ -n "$existing_caddy" ]; then
   fi
 fi
 
-# ---------- install base deps ----------
+# ---------- base deps ----------
 say "Installing base packages..."
 apk add --no-cache libcap iproute2 curl tar ca-certificates coreutils >/dev/null
 
-# ---------- ensure main+community repos for current Alpine ----------
+# ---------- enable repos for current Alpine branch ----------
 REL="$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || true)"
 if [ -n "$REL" ]; then
   REP="/etc/apk/repositories"
@@ -117,40 +115,44 @@ if [ -n "$REL" ]; then
   apk update >/dev/null 2>&1 || true
 fi
 
-# ---------- try APK caddy ----------
+# ---------- try APK install ----------
 APK_INSTALLED=0
-if apk add --no-cache caddy >/dev/null 2>&1; then
+if apk add --no-cache caddy caddy-openrc >/dev/null 2>&1; then
   APK_INSTALLED=1
 fi
 
-# Detect Caddy path so far
-CADDY_BIN="$(command -v caddy 2>/dev/null || true)"
-[ -z "$CADDY_BIN" ] && [ -x /usr/bin/caddy ] && CADDY_BIN="/usr/bin/caddy"
-
-# ---------- fallback: fetch versioned release asset (GitHub API) ----------
+# ---------- fallback: GitHub Releases (latest tag + asset) ----------
 fetch_caddy_release() {
   ARCH="$(uname -m)"
   case "$ARCH" in
-    x86_64)   DL_ARCH="amd64" ;;
-    aarch64)  DL_ARCH="arm64" ;;
-    armv7l|armv7) DL_ARCH="armv7" ;;
-    *) echo "[x] Unsupported architecture: $ARCH" >&2; return 1 ;;
+    x86_64)        DL_ARCH="amd64" ;;
+    aarch64)       DL_ARCH="arm64" ;;
+    armv7l|armv7)  DL_ARCH="armv7" ;;
+    *) echo "[x] Unsupported arch: $ARCH" >&2; return 1 ;;
   esac
 
   API_URL="https://api.github.com/repos/caddyserver/caddy/releases/latest"
-  JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: caddy-setup-script' "$API_URL")" || return 1
+  HDRS="-H Accept: application/vnd.github+json -H User-Agent: caddy-setup"
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    HDRS="$HDRS -H Authorization: Bearer ${GITHUB_TOKEN}"
+  fi
+  JSON="$(sh -c "curl -fsSL $HDRS $API_URL")" || return 1
   TAG="$(printf '%s' "$JSON" | awk -F'"' '/"tag_name":/ {print $4; exit}')"
   [ -n "$TAG" ] || { echo "[x] Could not determine latest Caddy tag from GitHub API." >&2; return 1; }
-  VER="${TAG#v}"
-  PKG="caddy_${VER}_linux_${DL_ARCH}.tar.gz"
-  URL_GH="https://github.com/caddyserver/caddy/releases/download/${TAG}/${PKG}"
+
+  # Pick the correct asset (name ends with _linux_<arch>.tar.gz)
+  URL="$(printf '%s' "$JSON" \
+    | awk -F'"' -v suff="_linux_${DL_ARCH}.tar.gz" '
+        $2=="name" {name=$4}
+        $2=="browser_download_url" {url=$4; if (name ~ suff) {print url; exit}}
+      ')"
+  [ -n "$URL" ] || { echo "[x] Could not find a linux ${DL_ARCH} asset in ${TAG}" >&2; return 1; }
 
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-  say "Downloading Caddy ${TAG} for ${DL_ARCH} from GitHub…"
-  if ! curl -fL --retry 3 "$URL_GH" -o "$TMP/caddy.tgz"; then
-    warn "GitHub download failed; trying SourceForge mirror…"
-    URL_SF="https://sourceforge.net/projects/caddy.mirror/files/${TAG}/${PKG}/download"
-    curl -fL --retry 3 "$URL_SF" -o "$TMP/caddy.tgz" || { echo "[x] Mirror download failed." >&2; return 1; }
+  say "Downloading Caddy ${TAG} for ${DL_ARCH}…"
+  if ! curl -fL --retry 3 "$URL" -o "$TMP/caddy.tgz"; then
+    echo "[x] Download failed: $URL" >&2
+    return 1
   fi
 
   gzip -t "$TMP/caddy.tgz" 2>/dev/null || { echo "[x] Not a valid .tar.gz (network/CDN error)" >&2; return 1; }
@@ -160,22 +162,25 @@ fetch_caddy_release() {
 
   install -m 0755 "$BIN_PATH" /usr/local/bin/caddy
   ln -sf /usr/local/bin/caddy /usr/bin/caddy
-  CADDY_BIN="/usr/local/bin/caddy"
-  return 0
+  command -v setcap >/dev/null 2>&1 && setcap 'cap_net_bind_service=+ep' /usr/local/bin/caddy || true
 }
 
-if [ -z "${CADDY_BIN:-}" ]; then
-  say "apk caddy not present — fetching Caddy from Releases…"
+if [ $APK_INSTALLED -eq 0 ]; then
+  say "apk caddy not present — fetching Caddy from GitHub Releases…"
   fetch_caddy_release || die "Failed to obtain Caddy binary."
 fi
 
-say "Caddy binary: $CADDY_BIN"
-command -v setcap >/dev/null 2>&1 && setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
+CADDY_BIN="$(command -v caddy 2>/dev/null || true)"
+[ -n "$CADDY_BIN" ] || die "Caddy binary not found after install."
 
-# ---------- dirs & ownership ----------
+say "Caddy binary: $CADDY_BIN"
+"$CADDY_BIN" version || true
+
+# ---------- user, dirs, ownership ----------
+adduser -D -H -s /sbin/nologin caddy 2>/dev/null || true
 say "Creating /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy..."
 mkdir -p /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy
-id caddy >/dev/null 2>&1 && chown -R caddy:caddy /var/lib/caddy /var/log/caddy || true
+chown -R caddy:caddy /var/lib/caddy /var/log/caddy
 
 # ---------- main Caddyfile ----------
 say "Writing /etc/caddy/Caddyfile for ${ZONE} (internal CA)…"
@@ -183,6 +188,7 @@ say "Writing /etc/caddy/Caddyfile for ${ZONE} (internal CA)…"
 cat > /etc/caddy/Caddyfile <<EOF
 {
   email ${ADMIN_EMAIL}
+  # admin API on (default) to allow reloads
   # debug
 }
 
@@ -239,7 +245,7 @@ if ! "$CADDY" validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
   echo "Config invalid; leaving file in place: $file" >&2
   exit 1
 fi
-rc-service caddy reload >/dev/null 2>&1 || rc-service caddy restart >/dev/null 2>&1
+rc-service caddy reload >/dev/null 2>&1 || { echo "Reload failed; restarting…"; rc-service caddy restart; }
 echo "Added vhost: https://${host} -> http://${up}"
 echo "File: $file"
 EOF
@@ -258,7 +264,7 @@ if ! "$CADDY" validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
   echo "Config invalid after removal!" >&2
   exit 1
 fi
-rc-service caddy reload >/dev/null 2>&1 || rc-service caddy restart >/dev/null 2>&1
+rc-service caddy reload >/dev/null 2>&1 || { echo "Reload failed; restarting…"; rc-service caddy restart; }
 echo "Removed vhost: https://$1"
 EOF
 chmod +x /usr/local/bin/caddy-del
@@ -266,23 +272,24 @@ chmod +x /usr/local/bin/caddy-del
 # ---------- OpenRC service ----------
 if [ $APK_INSTALLED -eq 1 ] && [ -f /etc/init.d/caddy ]; then
   say "Using packaged OpenRC service."
-  cat > /etc/conf.d/caddy <<EOF
+  cat > /etc/conf.d/caddy <<'EOF'
 export XDG_DATA_HOME="/var/lib/caddy"
 export XDG_CONFIG_HOME="/etc/caddy"
 command_args="run --environ --config /etc/caddy/Caddyfile"
 EOF
 else
   say "Creating custom OpenRC service…"
-  cat > /etc/init.d/caddy <<EOF
+  cat > /etc/init.d/caddy <<'EOF'
 #!/sbin/openrc-run
 name="Caddy"
 description="Caddy (LAN reverse proxy with internal TLS)"
-command="${CADDY_BIN}"
-command_args="\${command_args:-run --environ --config /etc/caddy/Caddyfile}"
+command="/usr/bin/caddy"
+command_args="${command_args:-run --environ --config /etc/caddy/Caddyfile}"
+command_user="caddy:caddy"
 supervisor="supervise-daemon"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="/var/log/\${RC_SVCNAME}.log"
-error_log="/var/log/\${RC_SVCNAME}.log"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
 depend() { need net; use dns logger; }
 start_pre() {
   export XDG_DATA_HOME="/var/lib/caddy"
@@ -291,6 +298,8 @@ start_pre() {
 EOF
   chmod +x /etc/init.d/caddy
   cat > /etc/conf.d/caddy <<'EOF'
+export XDG_DATA_HOME="/var/lib/caddy"
+export XDG_CONFIG_HOME="/etc/caddy"
 command_args="run --environ --config /etc/caddy/Caddyfile"
 EOF
 fi
@@ -308,8 +317,9 @@ say "Triggering internal TLS issuance (loopback)…"
 /bin/sh -c "$CADDY_BIN validate --config /etc/caddy/Caddyfile --adapter caddyfile" >/dev/null 2>&1 || true
 curl -skI --resolve "${ZONE}:443:127.0.0.1" "https://${ZONE}/" >/dev/null 2>&1 || true
 
+# copy the internal CA root where you'll grab it
 for p in \
-  /var/lib/caddy/pki/authorities/local/root.crt \
+  /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt \
   /root/.local/share/caddy/pki/authorities/local/root.crt \
   /home/caddy/.local/share/caddy/pki/authorities/local/root.crt
 do
@@ -331,14 +341,13 @@ cat <<EOF
 ➡️  In AdGuard Home add TWO DNS rewrites (Filters → DNS rewrites):
    1) ${ZONE}           → A → ${LXC_IP}
    2) *.${ZONE}         → A → ${LXC_IP}
-   (Add AAAA as well if your LAN uses IPv6 and this host has v6.)
 
 🧪 Test from a LAN client that uses AdGuard DNS:
    curl -I https://${ZONE}
 
 ➕ Add / remove hosts:
-   caddy-add pihole.${ZONE} 192.168.1.19 80
-   caddy-del pihole.${ZONE}
+   caddy-add adguard.${ZONE} 192.168.1.19 80
+   caddy-del adguard.${ZONE}
 
 🔐 Trust Caddy's local CA on your devices for no warnings:
    - Server copy: /root/caddy-internal-ca-root.crt
