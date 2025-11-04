@@ -1,95 +1,171 @@
 #!/bin/sh
-# Alpine (OpenRC): Caddy + internal TLS (LAN-only HTTPS)
-# - Optional purge of existing Caddy (with backups)
-# - Per-host vhosts in /etc/caddy/sites/*.caddy
-# - Shared snippet (lan-common) with internal CA + compression + headers
-# - Helpers: caddy-add / caddy-del
-# - Idempotent; safe to re-run
+# caddy-setup.sh — Alpine (OpenRC) Caddy with INTERNAL TLS (LAN-only)
+# - Interactive by default. Accepts CLI flags; ignores environment variables.
+# - Per-vhost layout in /etc/caddy/sites/*.caddy (one site block per hostname).
+# - Helpers: caddy-add / caddy-del (validate before reload).
+# - Optional purge of an existing Caddy install (with backup).
+#
+# Usage (interactive):
+#   sudo sh caddy-setup.sh
+#
+# Usage (non-interactive prompts via flags; still Alpine-only):
+#   sudo sh caddy-setup.sh --domain cordele.xyz --home-label home --admin-email you@cordele.xyz [--purge yes|no]
+#
+# Notes:
+# - Designed for Alpine Linux with OpenRC.
+# - You will add two DNS rewrites in AdGuard Home pointing to this host:
+#     home.<domain>     -> A -> <LXC_IP>
+#     *.home.<domain>   -> A -> <LXC_IP>
 
 set -eu
 
-# ---- Config via env or:  -s -- DOMAIN=... HOME_LABEL=... ADMIN_EMAIL=... ----
-DOMAIN="${DOMAIN:-cordele.xyz}"
-HOME_LABEL="${HOME_LABEL:-home}"              # serves home.$DOMAIN and subdomains
-ADMIN_EMAIL="${ADMIN_EMAIL:-you@cordele.xyz}"
-# PURGE behavior if Caddy already present: (unset = ask) 1=yes, 0=no
-PURGE="${PURGE:-}"
-# ------------------------------------------------------------------------------
-
-say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+# ------------- util -------------
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31m[x]\033[0m %s\n' "$*"; exit 1; }
+err()  { printf '\033[1;31m[x]\033[0m %s\n' "$*"; }
+die()  { err "$1"; exit 1; }
 
 require_root() { [ "$(id -u)" -eq 0 ] || die "Run as root (use sudo)."; }
+
+usage() {
+  cat <<EOF
+Usage:
+  sudo sh $0 [--domain example.com] [--home-label home] [--admin-email you@example.com] [--purge yes|no]
+
+If flags are omitted, you will be interactively prompted.
+
+Flags:
+  --domain        Your base domain (e.g., example.com)
+  --home-label    Sub-zone label to serve (default: home) -> serves home.<domain> and subdomains
+  --admin-email   Email for Caddy (used in logs / internal CA metadata)
+  --purge         If Caddy is already installed: yes|no (if omitted you'll be asked)
+EOF
+}
+
+# ------------- preflight -------------
 require_root
+
+# Ensure Alpine
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  [ "${ID:-}" = "alpine" ] || die "This script targets Alpine Linux (OpenRC). Detected: ${ID:-unknown}"
+else
+  die "Cannot detect OS. This script targets Alpine Linux."
+fi
+
+# Ignore environment variables for inputs; only CLI flags or interactive prompts
+DOMAIN=""
+HOME_LABEL=""
+ADMIN_EMAIL=""
+PURGE=""   # yes|no
+
+# ------------- parse flags -------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help|-h) usage; exit 0 ;;
+    --domain=*)      DOMAIN="${1#*=}"; shift ;;
+    --domain)        [ $# -gt 1 ] || die "Missing value for --domain"; DOMAIN="$2"; shift 2 ;;
+    --home-label=*)  HOME_LABEL="${1#*=}"; shift ;;
+    --home-label)    [ $# -gt 1 ] || die "Missing value for --home-label"; HOME_LABEL="$2"; shift 2 ;;
+    --admin-email=*) ADMIN_EMAIL="${1#*=}"; shift ;;
+    --admin-email)   [ $# -gt 1 ] || die "Missing value for --admin-email"; ADMIN_EMAIL="$2"; shift 2 ;;
+    --purge=*)       PURGE="$(printf '%s' "${1#*=}" | tr '[:upper:]' '[:lower:]')"; shift ;;
+    --purge)         [ $# -gt 1 ] || die "Missing value for --purge"; PURGE="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+    *) usage; die "Unknown flag: $1" ;;
+  esac
+done
+
+# ------------- interactive prompts if missing -------------
+ask() {
+  # $1=prompt  $2=default  -> sets REPLY_VAR
+  local prompt="$1" def="${2:-}" ans
+  if [ -n "$def" ]; then
+    printf "%s [%s]: " "$prompt" "$def"
+  else
+    printf "%s: " "$prompt"
+  fi
+  IFS= read -r ans || true
+  if [ -z "$ans" ]; then
+    ans="$def"
+  fi
+  REPLY_VAR="$ans"
+}
+
+# Domain
+if [ -z "$DOMAIN" ]; then
+  ask "Enter your domain (e.g., cordele.xyz)" ""
+  DOMAIN="$REPLY_VAR"
+fi
+[ -n "$DOMAIN" ] || die "Domain is required."
+
+# Home label
+if [ -z "$HOME_LABEL" ]; then
+  ask "Enter the sub-zone label (this creates <label>.$DOMAIN). Recommended: home" "home"
+  HOME_LABEL="$REPLY_VAR"
+fi
+
+# Admin email
+if [ -z "$ADMIN_EMAIL" ]; then
+  ask "Admin email (for Caddy metadata, e.g., you@$DOMAIN)" "you@$DOMAIN"
+  ADMIN_EMAIL="$REPLY_VAR"
+fi
 
 ZONE="${HOME_LABEL}.${DOMAIN}"
 
-# ---- Optional purge path if Caddy already exists ----
+# ------------- detect existing Caddy and maybe purge -------------
 if command -v caddy >/dev/null 2>&1; then
-  CADDY_BIN="$(command -v caddy)"
-  say "Detected existing Caddy at: ${CADDY_BIN}"
-  if [ -z "${PURGE}" ]; then
-    printf "Do you want to remove the old Caddy and clean config before continuing? [y/N]: "
+  if [ -z "$PURGE" ]; then
+    printf "Caddy is already installed at '%s'. Do you want to purge the old install first? [y/N]: " "$(command -v caddy)"
     read -r ans || true
-    case "$ans" in
-      y|Y|yes|YES) PURGE=1 ;;
-      *) PURGE=0 ;;
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) PURGE="yes" ;;
+      *)     PURGE="no" ;;
     esac
   fi
-
-  if [ "${PURGE}" = "1" ]; then
-    say "Stopping Caddy service (if running)..."
-    rc-service caddy stop >/dev/null 2>&1 || true
-    rc-update del caddy default >/dev/null 2>&1 || true
-
-    say "Backing up and removing old Caddy files..."
-    TS="$(date +%Y%m%d-%H%M%S)"
-    BK="/root/caddy-backup-${TS}"
-    mkdir -p "$BK"
-
-    for d in /etc/caddy /var/lib/caddy /var/log/caddy /etc/conf.d/caddy; do
-      if [ -e "$d" ]; then
-        cp -a "$d" "$BK/" 2>/dev/null || true
-        rm -rf "$d"
+  case "$PURGE" in
+    yes)
+      say "Purging existing Caddy install..."
+      rc-service caddy stop >/dev/null 2>&1 || true
+      rc-update del caddy default >/dev/null 2>&1 || true
+      TS="$(date +%Y%m%d-%H%M%S)"
+      BK="/root/caddy-backup-${TS}"
+      mkdir -p "$BK"
+      for d in /etc/caddy /var/lib/caddy /var/log/caddy /etc/conf.d/caddy; do
+        if [ -e "$d" ]; then
+          cp -a "$d" "$BK/" 2>/dev/null || true
+          rm -rf "$d"
+        fi
+      done
+      rm -f /usr/local/bin/caddy-add /usr/local/bin/caddy-del
+      if apk info -e caddy >/dev/null 2>&1; then
+        apk del caddy >/dev/null 2>&1 || true
+      else
+        CADDY_BIN="$(command -v caddy)"
+        rm -f "$CADDY_BIN" || true
       fi
-    done
-
-    # Remove helpers if present
-    rm -f /usr/local/bin/caddy-add /usr/local/bin/caddy-del
-
-    # If installed via apk, remove package; else remove standalone binary
-    if apk info -e caddy >/dev/null 2>&1; then
-      say "Removing apk package: caddy"
-      apk del caddy >/dev/null 2>&1 || true
-    else
-      warn "Caddy not owned by apk; removing ${CADDY_BIN}"
-      rm -f "${CADDY_BIN}" || true
-    fi
-
-    say "Old Caddy removed. Backup saved under: ${BK}"
-  else
-    warn "Keeping existing Caddy install; proceeding to (re)configure."
-  fi
+      say "Backup saved at: $BK"
+      ;;
+    no|"") : ;;
+    *) die "--purge must be yes or no (got: $PURGE)" ;;
+  esac
 fi
 
-# ---- Install fresh Caddy + deps ----
+# ------------- install packages -------------
 say "Installing packages..."
 apk add --no-cache caddy libcap iproute2 curl ca-certificates coreutils >/dev/null
 
-say "Allowing Caddy to bind :80/:443 without root (cap_net_bind_service)..."
+say "Granting CAP_NET_BIND_SERVICE to /usr/bin/caddy..."
 setcap 'cap_net_bind_service=+ep' /usr/bin/caddy 2>/dev/null || true
 
-say "Creating directories..."
+# ------------- directories & ownership -------------
+say "Creating /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy..."
 mkdir -p /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy
-
-# Ensure correct ownership for Alpine's packaged service (if user exists)
 if id caddy >/dev/null 2>&1; then
   chown -R caddy:caddy /var/lib/caddy /var/log/caddy || true
 fi
 
-# ---- Main Caddyfile (per-vhost import, internal TLS) ----
-say "Writing /etc/caddy/Caddyfile..."
+# ------------- write main Caddyfile -------------
+say "Writing /etc/caddy/Caddyfile for ${ZONE} (internal CA)..."
 if [ -f /etc/caddy/Caddyfile ]; then
   cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)"
 fi
@@ -99,7 +175,7 @@ cat > /etc/caddy/Caddyfile <<EOF
   # debug
 }
 
-# Shared LAN snippet: internal CA + compression + a couple of safe headers
+# Shared LAN snippet: internal CA + compression + safe headers
 (lan-common) {
   tls {
     issuer internal
@@ -121,7 +197,7 @@ ${ZONE} {
 import /etc/caddy/sites/*.caddy
 EOF
 
-# ---- Helpers ----
+# ------------- helpers -------------
 say "Installing helpers: caddy-add / caddy-del..."
 cat > /usr/local/bin/caddy-add <<'EOF'
 #!/bin/sh
@@ -186,7 +262,7 @@ fi
 EOF
 chmod +x /usr/local/bin/caddy-del
 
-# ---- OpenRC service config ----
+# ------------- OpenRC service -------------
 say "Configuring OpenRC service..."
 cat > /etc/conf.d/caddy <<'EOF'
 # Ensure Caddy writes its data (including internal CA) to /var/lib/caddy
@@ -200,16 +276,15 @@ rc-update add caddy default >/dev/null 2>&1 || true
 rc-service caddy restart >/dev/null 2>&1 || rc-service caddy start >/dev/null 2>&1 || true
 sleep 1
 
-# ---- Detect container IP to suggest AdGuard rewrites ----
+# ------------- detect IP & trigger issuance -------------
 IFACE="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}' || true)"
 LXC_IP="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 || true)"
 [ -n "${LXC_IP:-}" ] || LXC_IP="<LXC_IP>"
 
-# ---- Trigger internal TLS issuance (loopback) ----
 say "Triggering internal TLS issuance (loopback)..."
 curl -skI --resolve "${ZONE}:443:127.0.0.1" "https://${ZONE}/" >/dev/null 2>&1 || true
 
-# ---- Copy/install internal CA root into server trust (best-effort) ----
+# Copy internal CA root for convenience and try to trust it on the server
 CA_ROOT=""
 for p in \
   /var/lib/caddy/pki/authorities/local/root.crt \
@@ -224,6 +299,7 @@ if [ -n "$CA_ROOT" ]; then
   update-ca-certificates >/dev/null 2>&1 || true
 fi
 
+# ------------- summary -------------
 cat <<EOF
 
 ==============================================================
@@ -233,7 +309,7 @@ cat <<EOF
 ➡️  In AdGuard Home add TWO DNS rewrites (Filters → DNS rewrites):
    1) ${ZONE}           → A → ${LXC_IP}
    2) *.${ZONE}         → A → ${LXC_IP}
-   (Add AAAA as well if your LAN uses IPv6 and the LXC has v6.)
+   (Add AAAA as well if your LAN uses IPv6 and this host has v6.)
 
 🧪 Test from a LAN client that uses AdGuard DNS:
    curl -I https://${ZONE}
