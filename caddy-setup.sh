@@ -2,30 +2,22 @@
 # caddy-setup.sh — Alpine (OpenRC) Caddy with INTERNAL TLS (LAN-only)
 # - Interactive by default. Accepts CLI flags; ignores environment variables.
 # - Per-vhost layout in /etc/caddy/sites/*.caddy (one site block per hostname).
-# - Helpers: caddy-add / caddy-del (validate before reload).
+# - Helpers: caddy-add / caddy-del (validate before reload, absolute /usr/bin/caddy).
 # - Optional purge of an existing Caddy install (with backup).
 #
 # Usage (interactive):
 #   sudo sh caddy-setup.sh
 #
-# Usage (non-interactive prompts via flags; still Alpine-only):
+# Usage (flags; still prompts for anything missing):
 #   sudo sh caddy-setup.sh --domain cordele.xyz --home-label home --admin-email you@cordele.xyz [--purge yes|no]
-#
-# Notes:
-# - Designed for Alpine Linux with OpenRC.
-# - You will add two DNS rewrites in AdGuard Home pointing to this host:
-#     home.<domain>     -> A -> <LXC_IP>
-#     *.home.<domain>   -> A -> <LXC_IP>
 
 set -eu
 
-# ------------- util -------------
+# -------------------------- utils --------------------------
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m[x]\033[0m %s\n' "$*"; }
 die()  { err "$1"; exit 1; }
-
-require_root() { [ "$(id -u)" -eq 0 ] || die "Run as root (use sudo)."; }
 
 usage() {
   cat <<EOF
@@ -37,12 +29,14 @@ If flags are omitted, you will be interactively prompted.
 Flags:
   --domain        Your base domain (e.g., example.com)
   --home-label    Sub-zone label to serve (default: home) -> serves home.<domain> and subdomains
-  --admin-email   Email for Caddy (used in logs / internal CA metadata)
+  --admin-email   Email for Caddy metadata (internal CA)
   --purge         If Caddy is already installed: yes|no (if omitted you'll be asked)
 EOF
 }
 
-# ------------- preflight -------------
+require_root() { [ "$(id -u)" -eq 0 ] || die "Run as root (use sudo)."; }
+
+# ----------------------- preflight -------------------------
 require_root
 
 # Ensure Alpine
@@ -59,7 +53,7 @@ HOME_LABEL=""
 ADMIN_EMAIL=""
 PURGE=""   # yes|no
 
-# ------------- parse flags -------------
+# ---------------------- parse flags ------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
@@ -75,9 +69,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# ------------- interactive prompts if missing -------------
+# ----------------- interactive prompts ---------------------
 ask() {
-  # $1=prompt  $2=default  -> sets REPLY_VAR
+  # $1=prompt  $2=default -> sets REPLY_VAR
   local prompt="$1" def="${2:-}" ans
   if [ -n "$def" ]; then
     printf "%s [%s]: " "$prompt" "$def"
@@ -85,26 +79,21 @@ ask() {
     printf "%s: " "$prompt"
   fi
   IFS= read -r ans || true
-  if [ -z "$ans" ]; then
-    ans="$def"
-  fi
+  if [ -z "$ans" ]; then ans="$def"; fi
   REPLY_VAR="$ans"
 }
 
-# Domain
 if [ -z "$DOMAIN" ]; then
   ask "Enter your domain (e.g., cordele.xyz)" ""
   DOMAIN="$REPLY_VAR"
 fi
 [ -n "$DOMAIN" ] || die "Domain is required."
 
-# Home label
 if [ -z "$HOME_LABEL" ]; then
-  ask "Enter the sub-zone label (this creates <label>.$DOMAIN). Recommended: home" "home"
+  ask "Enter the sub-zone label (creates <label>.$DOMAIN). Recommended: home" "home"
   HOME_LABEL="$REPLY_VAR"
 fi
 
-# Admin email
 if [ -z "$ADMIN_EMAIL" ]; then
   ask "Admin email (for Caddy metadata, e.g., you@$DOMAIN)" "you@$DOMAIN"
   ADMIN_EMAIL="$REPLY_VAR"
@@ -112,10 +101,12 @@ fi
 
 ZONE="${HOME_LABEL}.${DOMAIN}"
 
-# ------------- detect existing Caddy and maybe purge -------------
-if command -v caddy >/dev/null 2>&1; then
+# --------- detect existing Caddy and maybe purge -----------
+if command -v /usr/bin/caddy >/dev/null 2>&1 || command -v caddy >/dev/null 2>&1; then
+  CADDY_BIN="$(command -v caddy || echo /usr/bin/caddy)"
+  say "Detected existing Caddy at: ${CADDY_BIN}"
   if [ -z "$PURGE" ]; then
-    printf "Caddy is already installed at '%s'. Do you want to purge the old install first? [y/N]: " "$(command -v caddy)"
+    printf "Do you want to purge the old Caddy install before continuing? [y/N]: "
     read -r ans || true
     case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
       y|yes) PURGE="yes" ;;
@@ -124,7 +115,7 @@ if command -v caddy >/dev/null 2>&1; then
   fi
   case "$PURGE" in
     yes)
-      say "Purging existing Caddy install..."
+      say "Purging existing Caddy..."
       rc-service caddy stop >/dev/null 2>&1 || true
       rc-update del caddy default >/dev/null 2>&1 || true
       TS="$(date +%Y%m%d-%H%M%S)"
@@ -140,7 +131,6 @@ if command -v caddy >/dev/null 2>&1; then
       if apk info -e caddy >/dev/null 2>&1; then
         apk del caddy >/dev/null 2>&1 || true
       else
-        CADDY_BIN="$(command -v caddy)"
         rm -f "$CADDY_BIN" || true
       fi
       say "Backup saved at: $BK"
@@ -150,21 +140,24 @@ if command -v caddy >/dev/null 2>&1; then
   esac
 fi
 
-# ------------- install packages -------------
+# ---------------- install packages -------------------------
 say "Installing packages..."
 apk add --no-cache caddy libcap iproute2 curl ca-certificates coreutils >/dev/null
+
+# Ensure binary exists where we expect
+[ -x /usr/bin/caddy ] || die "Caddy binary not found at /usr/bin/caddy after install."
 
 say "Granting CAP_NET_BIND_SERVICE to /usr/bin/caddy..."
 setcap 'cap_net_bind_service=+ep' /usr/bin/caddy 2>/dev/null || true
 
-# ------------- directories & ownership -------------
+# ----------------- dirs & ownership ------------------------
 say "Creating /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy..."
 mkdir -p /etc/caddy /etc/caddy/sites /var/lib/caddy /var/log/caddy
 if id caddy >/dev/null 2>&1; then
   chown -R caddy:caddy /var/lib/caddy /var/log/caddy || true
 fi
 
-# ------------- write main Caddyfile -------------
+# --------------- write main Caddyfile ----------------------
 say "Writing /etc/caddy/Caddyfile for ${ZONE} (internal CA)..."
 if [ -f /etc/caddy/Caddyfile ]; then
   cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)"
@@ -177,9 +170,7 @@ cat > /etc/caddy/Caddyfile <<EOF
 
 # Shared LAN snippet: internal CA + compression + safe headers
 (lan-common) {
-  tls {
-    issuer internal
-  }
+  tls internal
   encode zstd gzip
   header {
     X-Content-Type-Options nosniff
@@ -197,12 +188,16 @@ ${ZONE} {
 import /etc/caddy/sites/*.caddy
 EOF
 
-# ------------- helpers -------------
+# Optional: format file (no-op if already pretty)
+/usr/bin/caddy fmt -w /etc/caddy/Caddyfile >/dev/null 2>&1 || true
+
+# ------------------- helpers -------------------------------
 say "Installing helpers: caddy-add / caddy-del..."
 cat > /usr/local/bin/caddy-add <<'EOF'
 #!/bin/sh
 # Usage: caddy-add <host.fqdn> <backend_ip> [port] [path_prefix]
 set -eu
+CADDY=/usr/bin/caddy
 [ $# -ge 2 ] || { echo "Usage: $0 <host.fqdn> <backend_ip> [port] [path_prefix]" >&2; exit 1; }
 host="$1"; ip="$2"; port="${3:-}"; prefix="${4:-}"
 name=$(echo "$host" | tr '.' '-')
@@ -229,14 +224,14 @@ ${host} {
 EOT
 fi
 
-if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-  rc-service caddy reload >/dev/null 2>&1 || rc-service caddy restart >/dev/null 2>&1
-  echo "Added vhost: https://${host} -> http://${up}"
-  echo "File: $file"
-else
+# Validate and reload (show real errors if invalid)
+if ! "$CADDY" validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
   echo "Config invalid; leaving file in place: $file" >&2
   exit 1
 fi
+rc-service caddy reload >/dev/null 2>&1 || rc-service caddy restart >/dev/null 2>&1
+echo "Added vhost: https://${host} -> http://${up}"
+echo "File: $file"
 EOF
 chmod +x /usr/local/bin/caddy-add
 
@@ -244,6 +239,7 @@ cat > /usr/local/bin/caddy-del <<'EOF'
 #!/bin/sh
 # Usage: caddy-del <host.fqdn>
 set -eu
+CADDY=/usr/bin/caddy
 [ $# -eq 1 ] || { echo "Usage: $0 <host.fqdn>" >&2; exit 1; }
 name=$(echo "$1" | tr '.' '-')
 file="/etc/caddy/sites/${name}.caddy"
@@ -252,17 +248,16 @@ if [ ! -f "$file" ]; then
   exit 1
 fi
 rm -f "$file"
-if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-  rc-service caddy reload >/dev/null 2>&1 || rc-service caddy restart >/dev/null 2>&1
-  echo "Removed vhost: https://$1"
-else
+if ! "$CADDY" validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
   echo "Config invalid after removal!" >&2
   exit 1
 fi
+rc-service caddy reload >/dev/null 2>&1 || rc-service caddy restart >/dev/null 2>&1
+echo "Removed vhost: https://$1"
 EOF
 chmod +x /usr/local/bin/caddy-del
 
-# ------------- OpenRC service -------------
+# ----------------- OpenRC service --------------------------
 say "Configuring OpenRC service..."
 cat > /etc/conf.d/caddy <<'EOF'
 # Ensure Caddy writes its data (including internal CA) to /var/lib/caddy
@@ -276,7 +271,7 @@ rc-update add caddy default >/dev/null 2>&1 || true
 rc-service caddy restart >/dev/null 2>&1 || rc-service caddy start >/dev/null 2>&1 || true
 sleep 1
 
-# ------------- detect IP & trigger issuance -------------
+# ------------- detect IP & trigger issuance ----------------
 IFACE="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}' || true)"
 LXC_IP="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 || true)"
 [ -n "${LXC_IP:-}" ] || LXC_IP="<LXC_IP>"
@@ -299,7 +294,7 @@ if [ -n "$CA_ROOT" ]; then
   update-ca-certificates >/dev/null 2>&1 || true
 fi
 
-# ------------- summary -------------
+# ------------------------ summary --------------------------
 cat <<EOF
 
 ==============================================================
