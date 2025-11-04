@@ -134,27 +134,72 @@ fetch_caddy_release() {
     *) echo "[x] Unsupported arch: $ARCH" >&2; return 1 ;;
   esac
 
+  # Fallback version if API fails completely
+  FALLBACK_VERSION="v2.10.2"
+  TAG=""
+  URL=""
+
   API_URL="https://api.github.com/repos/caddyserver/caddy/releases/latest"
-  HDRS="-H Accept: application/vnd.github+json -H User-Agent: caddy-setup"
+
+  # Build curl command with proper header handling
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    HDRS="$HDRS -H Authorization: Bearer ${GITHUB_TOKEN}"
+    JSON="$(curl -fsSL \
+      -H "Accept: application/vnd.github+json" \
+      -H "User-Agent: caddy-setup" \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      "$API_URL" 2>&1)" || {
+        warn "GitHub API call failed. Will try fallback version ${FALLBACK_VERSION}"
+        JSON=""
+      }
+  else
+    JSON="$(curl -fsSL \
+      -H "Accept: application/vnd.github+json" \
+      -H "User-Agent: caddy-setup" \
+      "$API_URL" 2>&1)" || {
+        warn "GitHub API call failed (rate limited?). Will try fallback version ${FALLBACK_VERSION}"
+        warn "Tip: Set GITHUB_TOKEN env variable to avoid rate limits"
+        JSON=""
+      }
   fi
-  JSON="$(sh -c "curl -fsSL $HDRS $API_URL")" || return 1
-  TAG="$(printf '%s' "$JSON" | awk -F'"' '/"tag_name"/ {for(i=1;i<=NF;i++) if($i=="tag_name") print $(i+2); exit}')"
-  [ -n "$TAG" ] || { echo "[x] Could not determine latest Caddy tag from GitHub API." >&2; return 1; }
+
+  if [ -n "$JSON" ]; then
+    TAG="$(printf '%s' "$JSON" | awk -F'"' '/"tag_name"/ {for(i=1;i<=NF;i++) if($i=="tag_name") print $(i+2); exit}')"
+  fi
+
+  # Use fallback if API didn't work
+  if [ -z "$TAG" ]; then
+    warn "Using fallback version: ${FALLBACK_VERSION}"
+    TAG="$FALLBACK_VERSION"
+  fi
 
   # Pick the correct asset (name ends with _linux_<arch>.tar.gz)
-  URL="$(printf '%s' "$JSON" | grep -o "https://[^\"]*_linux_${DL_ARCH}\.tar\.gz" | grep -v '\.sig$' | head -n1)"
-  [ -n "$URL" ] || { echo "[x] Could not find a linux ${DL_ARCH} asset in ${TAG}" >&2; return 1; }
+  if [ -n "$JSON" ]; then
+    URL="$(printf '%s' "$JSON" | grep -o "https://[^\"]*_linux_${DL_ARCH}\.tar\.gz" | grep -v '\.sig$' | head -n1)"
+  fi
+
+  # Construct URL manually if we don't have it from API (fallback mode)
+  if [ -z "$URL" ]; then
+    VERSION_NUM="${TAG#v}"  # Remove 'v' prefix if present
+    URL="https://github.com/caddyserver/caddy/releases/download/${TAG}/caddy_${VERSION_NUM}_linux_${DL_ARCH}.tar.gz"
+    say "Constructed download URL: $URL"
+  fi
 
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
   say "Downloading Caddy ${TAG} for ${DL_ARCH}…"
-  if ! curl -fL --retry 3 "$URL" -o "$TMP/caddy.tgz"; then
+  say "URL: $URL"
+
+  # Try download with retries and better error output
+  if ! curl -fL --retry 3 --retry-delay 2 "$URL" -o "$TMP/caddy.tgz" 2>"$TMP/curl_error.log"; then
     echo "[x] Download failed: $URL" >&2
+    [ -f "$TMP/curl_error.log" ] && cat "$TMP/curl_error.log" >&2
     return 1
   fi
 
-  gzip -t "$TMP/caddy.tgz" 2>/dev/null || { echo "[x] Not a valid .tar.gz (network/CDN error)" >&2; return 1; }
+  if ! gzip -t "$TMP/caddy.tgz" 2>/dev/null; then
+    echo "[x] Not a valid .tar.gz (network/CDN error)" >&2
+    echo "[x] File size: $(ls -lh "$TMP/caddy.tgz" | awk '{print $5}')" >&2
+    return 1
+  fi
   tar -xzf "$TMP/caddy.tgz" -C "$TMP"
   BIN_PATH="$(find "$TMP" -maxdepth 1 -type f -name caddy -perm -u+x | head -n1 || true)"
   [ -n "$BIN_PATH" ] || { echo "[x] Archive did not contain an executable 'caddy' binary." >&2; return 1; }
