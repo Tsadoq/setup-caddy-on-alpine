@@ -1,7 +1,6 @@
 # Caddy LAN Reverse Proxy (Alpine/OpenRC)
 [![Made with Shell](https://img.shields.io/badge/Made%20with-Shell-4EAA25?logo=gnu-bash&logoColor=white)](#-requirements)
 [![Platform](https://img.shields.io/badge/Platform-Alpine%20Linux-blue?logo=alpinelinux&logoColor=white)](#-requirements)
-[![Headless Ready](https://img.shields.io/badge/Headless-Ready-success)](#-what-you-get)
 [![LAN TLS](https://img.shields.io/badge/TLS-Internal%20CA-informational)](#-security-model)
 
 Single-command setup for a **home LAN reverse proxy** on **Alpine Linux (OpenRC)** using **Caddy** with its **internal CA** (no public ACME, no Namecheap).
