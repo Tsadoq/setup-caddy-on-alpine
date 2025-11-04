@@ -1,7 +1,6 @@
 # Caddy LAN Reverse Proxy (Alpine/OpenRC)
 [![Made with Shell](https://img.shields.io/badge/Made%20with-Shell-4EAA25?logo=gnu-bash&logoColor=white)](#-requirements)
 [![Platform](https://img.shields.io/badge/Platform-Alpine%20Linux-blue?logo=alpinelinux&logoColor=white)](#-requirements)
-[![Headless Ready](https://img.shields.io/badge/Headless-Ready-success)](#-what-you-get)
 [![LAN TLS](https://img.shields.io/badge/TLS-Internal%20CA-informational)](#-security-model)
 
 Single-command setup for a **home LAN reverse proxy** on **Alpine Linux (OpenRC)** using **Caddy** with its **internal CA** (no public ACME, no Namecheap).
@@ -60,28 +59,30 @@ It installs Caddy, creates a clean **per-vhost layout**, adds **`caddy-add` / `c
 Run with your domain/email (defaults shown):
 
 ```bash
-curl -fsSL https://YOUR.URL/caddy-setup.sh \
-| sudo sh -s -- DOMAIN=cordele.xyz HOME_LABEL=home ADMIN_EMAIL=you@cordele.xyz
+curl -fsSL https://raw.githubusercontent.com/Tsadoq/setup-caddy-on-alpine/refs/heads/main/caddy-setup.sh | sudo sh -s -- DOMAIN=cordele.xyz HOME_LABEL=home ADMIN_EMAIL=you@cordele.xyz
+```
 
 Non-interactive purge of any prior install:
 
-curl -fsSL https://YOUR.URL/caddy-setup.sh \
-| sudo PURGE=1 sh -s -- DOMAIN=cordele.xyz HOME_LABEL=home ADMIN_EMAIL=you@cordele.xyz
+```bash
+curl -fsSL [https://YOUR.URL/caddy-setup.sh](https://raw.githubusercontent.com/Tsadoq/setup-caddy-on-alpine/refs/heads/main/caddy-setup.sh) | sudo PURGE=1 sh -s -- DOMAIN=cordele.xyz HOME_LABEL=home ADMIN_EMAIL=you@cordele.xyz
+```
 
 After it finishes, add two AdGuard DNS rewrites pointing to your LXC IP:
-
+```bash
 home.cordele.xyz     → A → 192.168.1.51
 *.home.cordele.xyz   → A → 192.168.1.51
-
+```
 Then add your first host:
-
+```bash
 caddy-add adguard.home.cordele.xyz 192.168.1.19 80
+```
 
 Test from a client that uses AdGuard DNS:
-
+```bash
 curl -I https://home.cordele.xyz
 curl -I https://adguard.home.cordele.xyz
-
+```
 
 ⸻
 
