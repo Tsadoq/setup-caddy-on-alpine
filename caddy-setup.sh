@@ -1,10 +1,17 @@
 #!/bin/sh
 # caddy-setup.sh — Alpine (OpenRC) Caddy with INTERNAL TLS (LAN-only)
-# - Interactive by default; or pass flags (no env).
-# - Tries apk; falls back to GitHub releases (tar.gz) if missing.
+# - Interactive by default; or pass flags (no env vars are read).
+# - Prefers APK install; automatically enables 'community' repo for your release.
+# - Falls back to GitHub releases tarball if APK is unavailable.
 # - Per-vhost layout in /etc/caddy/sites/*.caddy (one site block per hostname).
-# - Helpers: caddy-add / caddy-del (validate before reload, use detected caddy path).
+# - Helpers: caddy-add / caddy-del (validate before reload; auto-detect caddy path).
 # - Optional purge of an existing Caddy install (with backup).
+#
+# Usage (interactive):
+#   sudo sh caddy-setup.sh
+#
+# Usage (flags; prompts for anything missing):
+#   sudo sh caddy-setup.sh --domain cordele.xyz --home-label home --admin-email you@cordele.xyz [--purge yes|no]
 
 set -eu
 
@@ -24,7 +31,7 @@ Flags:
   --domain        Your base domain (e.g., example.com)
   --home-label    Sub-zone label (default: home) -> serves home.<domain> and subdomains
   --admin-email   Email for Caddy metadata (internal CA)
-  --purge         If Caddy is already installed: yes|no (if omitted you'll be asked)
+  --purge         If Caddy is already installed: yes|no (if omitted, you'll be asked)
 EOF
 }
 
@@ -56,6 +63,7 @@ done
 
 # -------- interactive prompts
 ask() {
+  # $1 prompt, $2 default -> REPLY_VAR
   local prompt="$1" def="${2:-}" ans
   [ -n "$def" ] && printf "%s [%s]: " "$prompt" "$def" || printf "%s: " "$prompt"
   IFS= read -r ans || true
@@ -101,6 +109,19 @@ fi
 say "Installing base packages..."
 apk add --no-cache libcap iproute2 curl tar ca-certificates coreutils >/dev/null
 
+# -------- ensure APK repos (main + community for current release)
+REL="$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || true)"
+if [ -n "$REL" ]; then
+  REP="/etc/apk/repositories"
+  # add main if missing
+  grep -q "/alpine/v${REL}/main" "$REP" 2>/dev/null || \
+    printf "https://dl-cdn.alpinelinux.org/alpine/v%s/main\n" "$REL" >> "$REP"
+  # add community if missing
+  grep -q "/alpine/v${REL}/community" "$REP" 2>/dev/null || \
+    printf "https://dl-cdn.alpinelinux.org/alpine/v%s/community\n" "$REL" >> "$REP"
+  apk update >/dev/null 2>&1 || true
+fi
+
 # -------- try apk caddy
 APK_INSTALLED=0
 if apk add --no-cache caddy >/dev/null 2>&1; then
@@ -122,8 +143,9 @@ if [ -z "${CADDY_BIN:-}" ]; then
   esac
   URL="https://github.com/caddyserver/caddy/releases/latest/download/${PKG}"
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-  curl -fsSL "$URL" -o "$TMP/caddy.tgz"
-  # Basic sanity check to avoid "invalid magic" (must be gzip)
+  if ! curl -fL --retry 3 "$URL" -o "$TMP/caddy.tgz"; then
+    die "Failed to download Caddy from GitHub releases."
+  fi
   if ! gzip -t "$TMP/caddy.tgz" 2>/dev/null; then
     die "Downloaded file is not a valid gzip archive (network or GitHub error)."
   fi
@@ -229,7 +251,7 @@ EOF
 chmod +x /usr/local/bin/caddy-del
 
 # -------- OpenRC service
-if [ -f /etc/init.d/caddy ] && apk info -e caddy >/dev/null 2>&1; then
+if [ $APK_INSTALLED -eq 1 ] && [ -f /etc/init.d/caddy ]; then
   say "Using packaged OpenRC service."
   cat > /etc/conf.d/caddy <<EOF
 export XDG_DATA_HOME="/var/lib/caddy"
@@ -247,7 +269,7 @@ command_args="\${command_args:-run --environ --config /etc/caddy/Caddyfile}"
 supervisor="supervise-daemon"
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/\${RC_SVCNAME}.log"
-error_log="/var/log/\var/log/\${RC_SVCNAME}.log"
+error_log="/var/log/\${RC_SVCNAME}.log"
 depend() { need net; use dns logger; }
 start_pre() {
   export XDG_DATA_HOME="/var/lib/caddy"
