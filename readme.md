@@ -59,4 +59,4 @@ It installs Caddy, creates a clean **per-vhost layout**, adds **`caddy-add` / `c
 Run with your domain/email (defaults shown):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Tsadoq/setup-caddy-on-alpine/refs/heads/main/readme.md/caddy-setup.sh | sudo sh -s -- DOMAIN=cordele.xyz HOME_LABEL=home ADMIN_EMAIL=you@cordele.xyz
+curl -fsSL https://raw.githubusercontent.com/Tsadoq/setup-caddy-on-alpine/refs/heads/main/readme.md/caddy-setup.sh | sudo sh -s -- DOMAIN=<example.com> HOME_LABEL=home ADMIN_EMAIL=you@example.com
