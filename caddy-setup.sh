@@ -1,7 +1,7 @@
 #!/bin/sh
 # caddy-setup.sh — Alpine (OpenRC) Caddy with INTERNAL TLS (LAN-only)
 # - Interactive by default; or pass flags (no env).
-# - Tries apk; falls back to official Caddy binary if missing.
+# - Tries apk; falls back to GitHub releases (tar.gz) if missing.
 # - Per-vhost layout in /etc/caddy/sites/*.caddy (one site block per hostname).
 # - Helpers: caddy-add / caddy-del (validate before reload, use detected caddy path).
 # - Optional purge of an existing Caddy install (with backup).
@@ -111,18 +111,26 @@ fi
 CADDY_BIN="$(command -v caddy 2>/dev/null || true)"
 [ -z "$CADDY_BIN" ] && [ -x /usr/bin/caddy ] && CADDY_BIN="/usr/bin/caddy"
 
-# -------- fallback: official binary if not present
+# -------- fallback: GitHub release (reliable tar.gz)
 if [ -z "${CADDY_BIN:-}" ]; then
-  say "apk caddy not present — fetching official Caddy binary..."
+  say "apk caddy not present — fetching Caddy from GitHub releases..."
   ARCH="$(uname -m)"; case "$ARCH" in
-    x86_64) DL_ARCH=amd64 ;; aarch64) DL_ARCH=arm64 ;;
-    armv7l|armv7) DL_ARCH=armv7 ;; *) die "Unsupported architecture: $ARCH" ;;
+    x86_64)   PKG="caddy_linux_amd64.tar.gz" ;;
+    aarch64)  PKG="caddy_linux_arm64.tar.gz" ;;
+    armv7l|armv7) PKG="caddy_linux_armv7.tar.gz" ;;
+    *) die "Unsupported architecture: $ARCH" ;;
   esac
-  URL="https://caddyserver.com/api/download?os=linux&arch=${DL_ARCH}"
+  URL="https://github.com/caddyserver/caddy/releases/latest/download/${PKG}"
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
   curl -fsSL "$URL" -o "$TMP/caddy.tgz"
+  # Basic sanity check to avoid "invalid magic" (must be gzip)
+  if ! gzip -t "$TMP/caddy.tgz" 2>/dev/null; then
+    die "Downloaded file is not a valid gzip archive (network or GitHub error)."
+  fi
   tar -xzf "$TMP/caddy.tgz" -C "$TMP"
+  [ -f "$TMP/caddy" ] || die "Archive did not contain 'caddy' binary."
   install -m 0755 "$TMP/caddy" /usr/local/bin/caddy
+  ln -sf /usr/local/bin/caddy /usr/bin/caddy
   CADDY_BIN="/usr/local/bin/caddy"
 fi
 
@@ -221,7 +229,7 @@ EOF
 chmod +x /usr/local/bin/caddy-del
 
 # -------- OpenRC service
-if [ $APK_INSTALLED -eq 1 ] && [ -f /etc/init.d/caddy ]; then
+if [ -f /etc/init.d/caddy ] && apk info -e caddy >/dev/null 2>&1; then
   say "Using packaged OpenRC service."
   cat > /etc/conf.d/caddy <<EOF
 export XDG_DATA_HOME="/var/lib/caddy"
@@ -239,7 +247,7 @@ command_args="\${command_args:-run --environ --config /etc/caddy/Caddyfile}"
 supervisor="supervise-daemon"
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/\${RC_SVCNAME}.log"
-error_log="/var/log/\${RC_SVCNAME}.log"
+error_log="/var/log/\var/log/\${RC_SVCNAME}.log"
 depend() { need net; use dns logger; }
 start_pre() {
   export XDG_DATA_HOME="/var/lib/caddy"
