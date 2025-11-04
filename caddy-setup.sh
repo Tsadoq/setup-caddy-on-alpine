@@ -102,7 +102,9 @@ fi
 
 # ---------- base deps ----------
 say "Installing base packages..."
-apk add --no-cache libcap iproute2 curl tar ca-certificates coreutils >/dev/null
+apk add --no-cache libcap iproute2 curl wget tar ca-certificates ca-certificates-bundle coreutils >/dev/null
+# Update CA certificates to fix TLS issues
+update-ca-certificates 2>/dev/null || true
 
 # ---------- enable repos for current Alpine branch ----------
 REL="$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || true)"
@@ -141,25 +143,40 @@ fetch_caddy_release() {
 
   API_URL="https://api.github.com/repos/caddyserver/caddy/releases/latest"
 
-  # Build curl command with proper header handling
+  # Try to fetch latest release info from GitHub API
+  JSON=""
   if [ -n "${GITHUB_TOKEN:-}" ]; then
     JSON="$(curl -fsSL \
       -H "Accept: application/vnd.github+json" \
       -H "User-Agent: caddy-setup" \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-      "$API_URL" 2>&1)" || {
-        warn "GitHub API call failed. Will try fallback version ${FALLBACK_VERSION}"
-        JSON=""
-      }
+      "$API_URL" 2>&1)" || JSON=""
   else
     JSON="$(curl -fsSL \
       -H "Accept: application/vnd.github+json" \
       -H "User-Agent: caddy-setup" \
-      "$API_URL" 2>&1)" || {
-        warn "GitHub API call failed (rate limited?). Will try fallback version ${FALLBACK_VERSION}"
-        warn "Tip: Set GITHUB_TOKEN env variable to avoid rate limits"
-        JSON=""
-      }
+      "$API_URL" 2>&1)" || JSON=""
+  fi
+
+  # If curl failed, try wget as fallback
+  if [ -z "$JSON" ] && command -v wget >/dev/null 2>&1; then
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      JSON="$(wget -qO- \
+        --header="Accept: application/vnd.github+json" \
+        --header="User-Agent: caddy-setup" \
+        --header="Authorization: Bearer ${GITHUB_TOKEN}" \
+        "$API_URL" 2>&1)" || JSON=""
+    else
+      JSON="$(wget -qO- \
+        --header="Accept: application/vnd.github+json" \
+        --header="User-Agent: caddy-setup" \
+        "$API_URL" 2>&1)" || JSON=""
+    fi
+  fi
+
+  if [ -z "$JSON" ]; then
+    warn "GitHub API call failed (TLS error or rate limited?). Will use fallback version ${FALLBACK_VERSION}"
+    warn "Tip: Set GITHUB_TOKEN env variable to avoid rate limits"
   fi
 
   if [ -n "$JSON" ]; then
@@ -188,10 +205,24 @@ fetch_caddy_release() {
   say "Downloading Caddy ${TAG} for ${DL_ARCH}…"
   say "URL: $URL"
 
-  # Try download with retries and better error output
-  if ! curl -fL --retry 3 --retry-delay 2 "$URL" -o "$TMP/caddy.tgz" 2>"$TMP/curl_error.log"; then
-    echo "[x] Download failed: $URL" >&2
+  # Try download with curl first, then fallback to wget
+  DOWNLOAD_OK=0
+  if curl -fL --retry 3 --retry-delay 2 "$URL" -o "$TMP/caddy.tgz" 2>"$TMP/curl_error.log"; then
+    DOWNLOAD_OK=1
+  else
+    warn "curl download failed, trying wget..."
     [ -f "$TMP/curl_error.log" ] && cat "$TMP/curl_error.log" >&2
+    if command -v wget >/dev/null 2>&1; then
+      if wget --tries=3 --timeout=30 -O "$TMP/caddy.tgz" "$URL" 2>"$TMP/wget_error.log"; then
+        DOWNLOAD_OK=1
+      else
+        [ -f "$TMP/wget_error.log" ] && cat "$TMP/wget_error.log" >&2
+      fi
+    fi
+  fi
+
+  if [ $DOWNLOAD_OK -eq 0 ]; then
+    echo "[x] Download failed with both curl and wget: $URL" >&2
     return 1
   fi
 
